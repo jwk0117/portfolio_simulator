@@ -601,40 +601,55 @@ if page.startswith("4"):
         mc_n_stocks = st.session_state.get("mc_n_stocks", 10)
         mc_seed = st.session_state.get("mc_seed", 42)
         st.caption(f"Monte Carlo enabled: {mc_n_trials} trials, {mc_n_stocks} stocks/event")
-    
+
     if st.button("Run"):
+        import traceback
+
+        run_record: Dict[str, Any] = {
+            "name": f"Run {len(st.session_state.runs) + 1}",
+            "sim_cfg": asdict(scfg),
+            "event_cfg": asdict(st.session_state.event_cfg) if st.session_state.event_cfg else None,
+            "analysis_summary": None,
+            "result": None,
+            "ok": False,
+            "error": None,
+            "traceback": None,
+        }
+
         try:
             # Run main strategy simulation
             sim = make_simulation(effective_events, scfg)
             res = run_simulation(sim)
             summ = analyze_result(res)
-            
+
             st.session_state.sim = sim
             st.session_state.result = res
             st.session_state.analysis_summary = summ
-            
+
+            run_record.update({"analysis_summary": summ, "result": res, "ok": True})
+
             # Run Monte Carlo if enabled
             if mc_enabled:
                 sheets_all = st.session_state.sheets
                 event_cfg = st.session_state.event_cfg
-                
+
                 # Get selected sheets (same logic as page 2)
                 sheet_table = st.session_state.sheet_table
                 if sheet_table is not None:
-                    use = sheet_table[sheet_table["Use"] == True].copy()
+                    use = sheet_table[sheet_table["Use"] == True].copy()  # noqa: E712
                     use = use.sort_values(["Order", "Name"], ascending=[True, True])
                     names = use["Name"].tolist()
                     selected_sheets = [s for s in sheets_all if s.name in set(names)]
                     selected_sheets = sorted(selected_sheets, key=lambda s: names.index(s.name))
                 else:
                     selected_sheets = sheets_all
-                
+
                 if selected_sheets and event_cfg:
                     progress_bar = st.progress(0, text="Running Monte Carlo simulations...")
-                    
+
                     def update_progress(current, total):
                         progress_bar.progress(current / total, text=f"Monte Carlo: {current}/{total} trials")
-                    
+
                     mc_result = run_monte_carlo_null_distribution(
                         selected_sheets,
                         event_cfg,
@@ -644,7 +659,7 @@ if page.startswith("4"):
                         random_state=mc_seed,
                         progress_callback=update_progress,
                     )
-                    
+
                     st.session_state.monte_carlo_result = mc_result
                     progress_bar.empty()
                     st.success(f"Monte Carlo completed: {mc_result['n_trials']} successful trials")
@@ -652,22 +667,18 @@ if page.startswith("4"):
                     st.warning("Could not run Monte Carlo - missing sheet data or event config")
             else:
                 st.session_state.monte_carlo_result = None
-                
-        except Exception as e:
-            st.error(f"Simulation failed: {e}")
-            import traceback
-            st.code(traceback.format_exc())
 
-            # Store in run history
-            st.session_state.runs.append(
-                {
-                    "name": f"Run {len(st.session_state.runs) + 1}",
-                    "sim_cfg": asdict(scfg),
-                    "event_cfg": asdict(st.session_state.event_cfg) if st.session_state.event_cfg else None,
-                    "analysis_summary": summ,
-                    "result": res,
-                }
-            )
+        except Exception as e:
+            run_record.update({
+                "ok": False,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            })
+            st.error(f"Simulation failed: {e}")
+            st.code(run_record["traceback"])
+        finally:
+            # Always store the attempt in run history so Page 5 can see it.
+            st.session_state.runs.append(run_record)
 
     res = st.session_state.result
     sim = st.session_state.sim
@@ -899,6 +910,24 @@ if page.startswith("5"):
     st.title("5) Compare & Export")
 
     runs = st.session_state.runs
+
+    # Backfill: if the user has a current result loaded in session but no run history,
+    # create a single run record so this page is usable without re-running.
+    if (not runs) and (isinstance(st.session_state.get("result"), dict)):
+        st.session_state.runs.append(
+            {
+                "name": "Run 1",
+                "sim_cfg": asdict(st.session_state.sim_cfg) if st.session_state.sim_cfg else None,
+                "event_cfg": asdict(st.session_state.event_cfg) if st.session_state.event_cfg else None,
+                "analysis_summary": st.session_state.get("analysis_summary"),
+                "result": st.session_state.get("result"),
+                "ok": True,
+                "error": None,
+                "traceback": None,
+            }
+        )
+        runs = st.session_state.runs
+
     if not runs:
         st.info("No runs yet. Run at least one simulation in Page 4.")
         st.stop()
