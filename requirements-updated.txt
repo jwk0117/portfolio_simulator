@@ -1,0 +1,20 @@
+# Portfolio Simulator GUI - Requirements (Updated 2026-01-19)
+# For Streamlit Community Cloud deployment
+# Changes: Removed unused openpyxl, updated version constraints
+
+# Core framework
+streamlit>=1.53.0
+
+# Data handling
+pandas>=2.3.0
+numpy>=2.4.0
+
+# Market data
+yfinance>=1.0
+
+# Visualization
+plotly>=6.5.0
+matplotlib>=3.10.0
+
+# File format support
+pyarrow>=23.0.0
