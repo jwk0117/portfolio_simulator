@@ -1,0 +1,742 @@
+# -*- coding: utf-8 -*-
+"""portfolio_gui_app.py
+
+Streamlit GUI for the portfolio_sim backtesting engine.
+
+How to run
+----------
+1) Install dependencies (recommended in a fresh environment):
+      pip install -r requirements_gui.txt
+
+2) Ensure portfolio_sim.py is in the same folder as this file.
+
+3) Start the app:
+      streamlit run portfolio_gui_app.py
+
+This app expects the input dataset as a preprocessed .pkl. The .pkl should
+contain "sheet-like" DataFrames that drive Event construction.
+
+Implementation note
+-------------------
+portfolio_sim.plot_simulation() calls plt.show() and does not return the Figure.
+In a GUI context we suppress plt.show() temporarily and capture active figures.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import matplotlib.pyplot as plt
+import inspect
+
+import portfolio_sim as ps
+import portfolio_gui_plotting as pgp
+from portfolio_gui_io import SheetItem, extract_sheet_items, infer_column_candidates, load_pkl_bytes, load_pkl_path, summarize_object
+from portfolio_gui_core import (
+    EventBuildConfig,
+    SimulationConfig,
+    analyze_result,
+    build_events,
+    dump_events_json,
+    infer_sim_date_range_from_events,
+    make_simulation,
+    result_to_parquet_bytes,
+    run_simulation,
+)
+
+
+# -----------------------------
+# Streamlit setup
+# -----------------------------
+
+st.set_page_config(page_title="Portfolio Simulator GUI", layout="wide")
+
+st.markdown("""
+<style>
+/* Dark theme overrides */
+:root {
+  --bg: #0e1117;
+  --fg: #fafafa;
+}
+[data-testid="stAppViewContainer"] { background: var(--bg); }
+[data-testid="stHeader"], [data-testid="stToolbar"] { background: var(--bg); }
+[data-testid="stSidebar"] { background: #111827; }
+html, body, [class*="css"] { color: var(--fg); }
+</style>
+""", unsafe_allow_html=True)
+
+
+def _ss_init(key: str, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+_ss_init("raw_obj", None)
+_ss_init("sheets", [])                 # List[SheetItem]
+_ss_init("sheet_table", None)          # user edited selection/order table
+_ss_init("colmap", {})                 # mapping config
+_ss_init("event_cfg", None)            # EventBuildConfig
+_ss_init("events", None)               # List[Event]
+_ss_init("events_detail", None)        # pd.DataFrame
+_ss_init("events_summary", None)       # dict
+_ss_init("sim_cfg", None)              # SimulationConfig
+_ss_init("sim", None)                  # Simulation
+_ss_init("result", None)               # dict[str, DataFrame]
+_ss_init("analysis_summary", None)     # pd.DataFrame
+_ss_init("runs", [])                   # list of run dicts
+
+
+def _safe_str_list(text: str) -> Optional[List[str]]:
+    """Parse a newline/comma separated string list."""
+    if text is None:
+        return None
+    items = []
+    for line in str(text).replace(",", "\n").splitlines():
+        s = line.strip()
+        if s:
+            items.append(s)
+    return items or None
+
+
+def _sheet_selector_ui(sheet_items: Sequence[SheetItem]) -> List[SheetItem]:
+    """UI to select and order sheets.
+
+    Returns the ordered subset.
+    """
+    if not sheet_items:
+        return []
+
+    df = pd.DataFrame(
+        {
+            "Use": True,
+            "Order": np.arange(len(sheet_items), dtype=int) + 1,
+            "Name": [s.name for s in sheet_items],
+            "Rows": [int(len(s.df)) for s in sheet_items],
+            "Cols": [int(s.df.shape[1]) for s in sheet_items],
+        }
+    )
+
+    st.caption("Select which sheets to include and define their order.")
+    edited = st.data_editor(
+        df,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Use": st.column_config.CheckboxColumn(required=True),
+            "Order": st.column_config.NumberColumn(min_value=1, step=1),
+        },
+        key="sheet_table_editor",
+    )
+
+    # Keep for downstream steps
+    st.session_state.sheet_table = edited
+
+    use = edited[edited["Use"] == True].copy()  # noqa: E712
+    use = use.sort_values(["Order", "Name"], ascending=[True, True])
+    names = use["Name"].tolist()
+    out = [s for s in sheet_items if s.name in set(names)]
+    # reorder to match names order
+    out = sorted(out, key=lambda s: names.index(s.name))
+    return out
+
+
+def _pick_columns_ui(sheet_items: Sequence[SheetItem]) -> Dict[str, str]:
+    """UI for selecting the ticker/datetime/ordering columns."""
+    if not sheet_items:
+        return {}
+
+    st.subheader("Column mapping")
+    st.write(
+        "Choose which columns in your sheets correspond to:"
+        "\n- Ticker (Yahoo Finance / yfinance ticker)"
+        "\n- Event datetime"
+        "\n- Ordering metric (used to rank/select top-N tickers per event)"
+    )
+
+    # Use the first selected sheet as a template
+    df0 = sheet_items[0].df
+    cands = infer_column_candidates(df0)
+    cols = list(df0.columns)
+
+    ticker_col = st.selectbox("Ticker column", options=cols, index=cols.index(cands["ticker"][0]) if cands["ticker"] and cands["ticker"][0] in cols else 0)
+    datetime_col = st.selectbox("Datetime column", options=cols, index=cols.index(cands["datetime"][0]) if cands["datetime"] and cands["datetime"][0] in cols else 0)
+
+    numeric_cols = cands["numeric"] if cands["numeric"] else cols
+    ordering_col = st.selectbox("Ordering metric column", options=numeric_cols, index=0)
+
+    weight_col = st.selectbox(
+        "Weight column (optional)",
+        options=["(same as ordering metric)"] + list(numeric_cols),
+        index=0,
+    )
+    weight_col = None if weight_col == "(same as ordering metric)" else weight_col
+
+    mapping = {
+        "ticker_col": ticker_col,
+        "datetime_col": datetime_col,
+        "ordering_col": ordering_col,
+        "weight_col": weight_col,
+    }
+
+    st.session_state.colmap = mapping
+    st.write("Preview (first selected sheet):")
+    st.dataframe(df0.head(25), width="stretch")
+
+    return mapping
+
+
+def _capture_matplotlib_figures(func, *args, **kwargs):
+    """Run a plotting function and capture all created matplotlib figures."""
+    prev_show = plt.show
+    plt.show = lambda *a, **k: None  # type: ignore
+    try:
+        before = set(plt.get_fignums())
+        func(*args, **kwargs)
+        after = set(plt.get_fignums())
+        new_nums = sorted(list(after - before))
+        if not new_nums:
+            # Fallback: capture current figure, if any
+            new_nums = sorted(list(after))
+        figs = [plt.figure(n) for n in new_nums]
+        return figs
+    finally:
+        plt.show = prev_show
+
+
+# -----------------------------
+# Sidebar navigation
+# -----------------------------
+
+st.sidebar.title("Portfolio Simulator GUI")
+page = st.sidebar.radio(
+    "Workflow",
+    [
+        "1) Load & Validate",
+        "2) Build Events",
+        "3) Simulation Parameters",
+        "4) Run & Analyze",
+        "5) Compare & Export",
+    ],
+)
+
+
+# -----------------------------
+# Page 1: Load & Validate
+# -----------------------------
+
+if page.startswith("1"):
+    st.title("1) Load & Validate (.pkl)")
+
+    st.info(
+        "This GUI loads a preprocessed .pkl and extracts one or more sheet-like DataFrames. "
+        "Pickle files should only be loaded from sources you trust."
+    )
+
+    colA, colB = st.columns([2, 1])
+    with colA:
+        uploaded = st.file_uploader("Upload a preprocessed .pkl", type=["pkl", "pickle"]) 
+    with colB:
+        path = st.text_input("Or enter a local path", value="")
+
+    load_clicked = st.button("Load")
+
+    if load_clicked:
+        obj = None
+        err = None
+        try:
+            if uploaded is not None:
+                obj = load_pkl_bytes(uploaded.getvalue())
+            elif path.strip():
+                obj = load_pkl_path(path.strip())
+            else:
+                err = "Provide an uploaded file or a valid local path."
+        except Exception as e:
+            err = f"Failed to load pickle: {e}"
+
+        if err:
+            st.error(err)
+        else:
+            st.session_state.raw_obj = obj
+            sheets = extract_sheet_items(obj)
+            st.session_state.sheets = sheets
+            st.session_state.events = None
+            st.session_state.result = None
+            st.session_state.analysis_summary = None
+
+    raw = st.session_state.raw_obj
+    if raw is not None:
+        st.subheader("Detected structure")
+        st.json(summarize_object(raw))
+
+    sheets_all: List[SheetItem] = st.session_state.sheets
+    if sheets_all:
+        st.subheader("Sheets detected")
+        st.write(f"Found {len(sheets_all)} sheet(s).")
+
+        selected_sheets = _sheet_selector_ui(sheets_all)
+        if selected_sheets:
+            st.subheader("Column mapping")
+            mapping = _pick_columns_ui(selected_sheets)
+            st.success(
+                "Load step complete. Proceed to '2) Build Events' once your sheet selection and column mapping look correct."
+            )
+        else:
+            st.warning("No sheets selected.")
+    elif raw is not None:
+        st.warning(
+            "No sheet-like DataFrames were detected. "
+            "Expected a list of DataFrames, a dict of name->DataFrame, or a dict with keys like 'sheets'."
+        )
+
+
+# -----------------------------
+# Page 2: Build Events
+# -----------------------------
+
+if page.startswith("2"):
+    st.title("2) Build Events")
+
+    sheets_all: List[SheetItem] = st.session_state.sheets
+    if not sheets_all:
+        st.warning("Load your .pkl first (Page 1).")
+        st.stop()
+
+    # Reconstruct selected sheets in the same way as page 1, based on the edited table.
+    selected_sheets = _sheet_selector_ui(sheets_all)
+    if not selected_sheets:
+        st.warning("Select at least one sheet.")
+        st.stop()
+
+    mapping = st.session_state.colmap or _pick_columns_ui(selected_sheets)
+    if not mapping:
+        st.warning("Define column mapping first.")
+        st.stop()
+
+    st.subheader("Selection and weighting")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        direction = st.selectbox("Direction", ["ascend", "descend"], index=0)
+        top_n = st.number_input("Top N", min_value=1, max_value=200, value=10, step=1)
+    with c2:
+        weight_mode = st.selectbox("Weight mode", ["equal", "proportional", "softmax", "inverse_rank"], index=0)
+        softmax_tau = st.number_input("Softmax temperature (tau)", min_value=0.01, value=1.0, step=0.25)
+    with c3:
+        dedupe = st.selectbox("De-dupe", ["first", "none"], index=0)
+        tie_breaker = st.selectbox("Tie breaker", ["stable", "random"], index=0)
+
+    include_txt = st.text_area("Include tickers (optional; comma/newline separated)", value="")
+    exclude_txt = st.text_area("Exclude tickers (optional; comma/newline separated)", value="")
+    include = _safe_str_list(include_txt)
+    exclude = _safe_str_list(exclude_txt)
+
+    random_state = st.number_input("Random seed (optional)", min_value=0, value=0, step=1)
+    use_seed = st.checkbox("Use random seed", value=False)
+    rs = int(random_state) if use_seed else None
+
+    cfg = EventBuildConfig(
+        ticker_col=mapping["ticker_col"],
+        datetime_col=mapping["datetime_col"],
+        ordering_col=mapping["ordering_col"],
+        direction=direction,
+        top_n=int(top_n),
+        weight_mode=weight_mode,
+        weight_col=mapping.get("weight_col", None),
+        softmax_tau=float(softmax_tau),
+        include=include,
+        exclude=exclude,
+        dedupe=dedupe,
+        tie_breaker=tie_breaker,
+        random_state=rs,
+    )
+    st.session_state.event_cfg = cfg
+
+    if st.button("Build events"):
+        try:
+            events, detail_df, summary = build_events(selected_sheets, cfg)
+        except Exception as e:
+            st.error(f"Failed to build events: {e}")
+        else:
+            st.session_state.events = events
+            st.session_state.events_detail = detail_df
+            st.session_state.events_summary = summary
+            st.session_state.result = None
+            st.session_state.analysis_summary = None
+            st.success(f"Built {len(events)} event(s).")
+
+    events = st.session_state.events
+    if events:
+        st.subheader("Event summary")
+        try:
+            d0, d1 = infer_sim_date_range_from_events(events)
+            st.write({"first_event": str(d0.date()), "last_event": str(d1.date()), "num_events": len(events)})
+        except Exception:
+            st.write({"num_events": len(events)})
+
+        summary = st.session_state.events_summary
+        if isinstance(summary, dict):
+            with st.expander("Build summary"):
+                st.json({k: (str(v) if isinstance(v, (pd.Timestamp,)) else v) for k, v in summary.items() if k != "ticker_meta"})
+
+        detail_df = st.session_state.events_detail
+        if isinstance(detail_df, pd.DataFrame) and not detail_df.empty:
+            with st.expander("Selection detail"):
+                st.dataframe(detail_df, width="stretch")
+
+        # Download events as JSON
+        st.download_button(
+            "Download events.json",
+            data=dump_events_json(events).encode("utf-8"),
+            file_name="events.json",
+            mime="application/json",
+        )
+
+
+# -----------------------------
+# Page 3: Simulation Parameters
+# -----------------------------
+
+if page.startswith("3"):
+    st.title("3) Simulation Parameters")
+
+    events = st.session_state.events
+    if not events:
+        st.warning("Build events first (Page 2).")
+        st.stop()
+
+    d0, d1 = infer_sim_date_range_from_events(events)
+    st.caption(f"Default date range inferred from events: {d0.date()} to {d1.date()}")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        start_date = st.date_input("Start date", value=d0.date())
+        end_date = st.date_input("End date", value=d1.date())
+        initial_capital = st.number_input("Initial capital", min_value=0.0, value=100000.0, step=1000.0, format="%.2f")
+    with col2:
+        cash_policy = st.selectbox("Cash policy", ["None", "fixed", "proportion"], index=0)
+        cash_fixed_amount = st.number_input("Cash fixed amount", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
+        cash_pct = st.number_input("Cash proportion (0-1)", min_value=0.0, max_value=1.0, value=0.0, step=0.05, format="%.2f")
+    with col3:
+        max_leverage = st.number_input("Max leverage", min_value=1.0, value=1.0, step=0.1, format="%.2f")
+        margin_rate_apr = st.number_input("Margin APR (e.g., 0.05 = 5%)", min_value=0.0, value=0.0, step=0.01, format="%.4f")
+        rebalance_mode = st.selectbox("Rebalance mode", ["adjust", "rebuild"], index=0)
+        use_adj_close = st.checkbox("Use Adj Close (Yahoo Adj Close)", value=False)
+
+    st.subheader("Ensemble / randomization")
+    e1, e2, e3, e4 = st.columns(4)
+    with e1:
+        shuffle_events = st.checkbox("Shuffle events", value=False)
+        num_shuffle = st.number_input("# shuffles", min_value=1, value=100, step=10)
+    with e2:
+        shuffle_window_days = st.number_input("Shuffle window days (optional)", min_value=0.0, value=0.0, step=1.0, format="%.1f")
+        use_shuffle_window = st.checkbox("Enable shuffle window", value=False)
+    with e3:
+        weight_method = st.selectbox("Weight method", ["None", "random", "uniform"], index=0)
+    with e4:
+        use_seed = st.checkbox("Use random seed", value=False, key="sim_use_seed")
+        seed = st.number_input("Seed", min_value=0, value=0, step=1, key="sim_seed")
+
+    st.subheader("Dollar-neutral overlay")
+    dn1, dn2, dn3, dn4 = st.columns(4)
+    with dn1:
+        dollar_neutral = st.checkbox("Dollar neutral", value=False)
+    with dn2:
+        hedge_symbol = st.text_input("Hedge symbol", value="SPY")
+    with dn3:
+        hedge_notional_base = st.selectbox("Hedge base", ["total", "gross_long"], index=0)
+    with dn4:
+        hedge_rounding = st.selectbox("Hedge rounding", ["floor", "round"], index=0)
+
+    scfg = SimulationConfig(
+        start_date=pd.Timestamp(start_date),
+        end_date=pd.Timestamp(end_date),
+        initial_capital=float(initial_capital),
+        shuffle_events=bool(shuffle_events),
+        num_shuffle=int(num_shuffle),
+        shuffle_window_days=float(shuffle_window_days) if use_shuffle_window else None,
+        weight_method=None if weight_method == "None" else weight_method,
+        random_state=int(seed) if use_seed else None,
+        cash_policy=None if cash_policy == "None" else cash_policy,
+        cash_fixed_amount=float(cash_fixed_amount),
+        cash_pct=float(cash_pct),
+        rebalance_mode=str(rebalance_mode),
+        use_adj_close=bool(use_adj_close),
+        max_leverage=float(max_leverage),
+        margin_rate_apr=float(margin_rate_apr),
+        dollar_neutral=bool(dollar_neutral),
+        hedge_symbol=str(hedge_symbol).strip() or "SPY",
+        hedge_notional_base=str(hedge_notional_base),
+        hedge_rounding=str(hedge_rounding),
+    )
+
+    st.session_state.sim_cfg = scfg
+    st.success("Simulation parameters saved in session. Proceed to '4) Run & Analyze'.")
+
+
+# -----------------------------
+# Page 4: Run & Analyze
+# -----------------------------
+
+if page.startswith("4"):
+    st.title("4) Run & Analyze")
+
+    events = st.session_state.events
+    scfg: SimulationConfig = st.session_state.sim_cfg
+    if not events:
+        st.warning("Build events first (Page 2).")
+        st.stop()
+    if scfg is None:
+        st.warning("Set simulation parameters first (Page 3).")
+        st.stop()
+
+    st.subheader("Run simulation")
+    if st.button("Run"):
+        try:
+            sim = make_simulation(events, scfg)
+            res = run_simulation(sim)
+            summ = analyze_result(res)
+        except Exception as e:
+            st.error(f"Simulation failed: {e}")
+        else:
+            st.session_state.sim = sim
+            st.session_state.result = res
+            st.session_state.analysis_summary = summ
+
+            # Store in run history
+            st.session_state.runs.append(
+                {
+                    "name": f"Run {len(st.session_state.runs) + 1}",
+                    "sim_cfg": asdict(scfg),
+                    "event_cfg": asdict(st.session_state.event_cfg) if st.session_state.event_cfg else None,
+                    "analysis_summary": summ,
+                    "result": res,
+                }
+            )
+
+    res = st.session_state.result
+    sim = st.session_state.sim
+    summ = st.session_state.analysis_summary
+
+    if isinstance(summ, pd.DataFrame):
+        st.subheader("Performance summary")
+        st.dataframe(summ, width="stretch")
+
+        st.download_button(
+            "Download summary.csv",
+            data=summ.to_csv(index=True).encode("utf-8"),
+            file_name="analysis_summary.csv",
+            mime="text/csv",
+        )
+
+    if isinstance(res, dict) and sim is not None:
+        tabs = st.tabs(["Visualization - Performance", "Trades", "Data Health"])
+
+        # -------------------------
+        # Tab 1: Performance + Heatmap
+        # -------------------------
+        with tabs[0]:
+            st.subheader("Visualization")
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                backend = st.radio("Plot backend", ["Interactive (Plotly)", "Matplotlib"], index=0, horizontal=False)
+            with c2:
+                y_as = st.selectbox("Y-axis", ["pct", "value", "index", "log"], index=0)
+                show_bench = st.checkbox("Benchmarks", value=True)
+            with c3:
+                show_events = st.checkbox("Event markers (dots)", value=True)
+            with c4:
+                top_n = st.number_input("Heatmap slots (top N)", min_value=1, value=10, step=1)
+                hm_clip = st.number_input("Heatmap clip (abs %; 0=auto)", min_value=0.0, value=20.0, step=1.0)
+                hm_clip = None if hm_clip <= 0 else float(hm_clip)
+
+            if backend.startswith("Interactive"):
+                try:
+                    fig = pgp.make_performance_figure(
+                        result=res,
+                        sim=sim,
+                        y_as=y_as,
+                        show_benchmarks=bool(show_bench),
+                        show_events=bool(show_events),
+                        title="",
+                        template="plotly_dark",
+                    )
+                    st.plotly_chart(fig, width="stretch")
+                except Exception as e:
+                    st.error(f"Interactive plot failed; falling back to Matplotlib. Error: {e}")
+                    backend = "Matplotlib"
+
+            if backend == "Matplotlib":
+                plot_kwargs = dict(
+                    result=res,
+                    sim=sim,
+                    y_as=y_as,
+                    show_benchmarks=show_bench,
+                    # Matplotlib fallback: event markers and heatmap are handled in the Plotly plotting module.
+                )
+                figs = _capture_matplotlib_figures(ps.plot_simulation, **plot_kwargs)
+                for fig in figs:
+                    st.pyplot(fig, clear_figure=False, width="stretch")
+                    plt.close(fig)
+
+            st.markdown("---")
+            st.subheader("Holdings Heatmap")
+            try:
+                fig_hm = pgp.make_holdings_heatmap_figure(
+                    result=res,
+                    sim=sim,
+                    top_n=int(top_n),
+                    clip=hm_clip,
+                )
+                st.plotly_chart(fig_hm, width="stretch")
+            except Exception as e:
+                st.error(f"Holdings heatmap failed: {e}")
+
+        # -------------------------
+        # Tab 2: Trades
+        # -------------------------
+        with tabs[1]:
+            st.subheader("Trade Log")
+            trades_df = None
+            if isinstance(res.get("trades"), pd.DataFrame):
+                trades_df = res.get("trades")
+            elif isinstance(res.get("trades_with_cash"), pd.DataFrame):
+                trades_df = res.get("trades_with_cash")
+            elif isinstance(res.get("trades_no_cash"), pd.DataFrame):
+                trades_df = res.get("trades_no_cash")
+
+            if trades_df is None or trades_df.empty:
+                st.info("No trade log available in this result")
+            else:
+                st.dataframe(trades_df, width="stretch")
+                st.download_button(
+                    "Download trades.csv",
+                    data=trades_df.to_csv(index=False).encode("utf-8"),
+                    file_name="trade_log.csv",
+                    mime="text/csv",
+                )
+
+        # -------------------------
+        # Tab 3: Data Health
+        # -------------------------
+        with tabs[2]:
+            st.subheader("Data Health")
+            dh = res.get("data_health", None)
+            if not isinstance(dh, pd.DataFrame) or dh.empty:
+                st.info("No data health report available in this result")
+            else:
+                st.dataframe(dh, width="stretch")
+                st.download_button(
+                    "Download data_health.csv",
+                    data=dh.to_csv(index=True).encode("utf-8"),
+                    file_name="data_health.csv",
+                    mime="text/csv",
+                )
+
+            # Heatmap-only NaN imputations (if any)
+            try:
+                # Only defined for non-ensemble primary strategy
+                _, df = pgp._pick_strategy_df(res)
+                if not pgp._is_ensemble_df(df):
+                    hm = ps.compute_holdings_heatmap(sim=sim, strategy_df=df, top_n=int(top_n), clip=hm_clip)
+                    imps = hm.get("imputation_points", []) or []
+                    if imps:
+                        st.markdown("#### Heatmap NaN imputations")
+                        imp_df = pd.DataFrame(imps)
+                        st.dataframe(imp_df, width="stretch")
+                        counts = hm.get("imputation_counts", {}) or {}
+                        if counts:
+                            st.markdown("**Imputation counts by ticker**")
+                            st.dataframe(pd.Series(counts, name="n_imputations").sort_values(ascending=False).to_frame(), width="stretch")
+            except Exception:
+                pass
+
+        # Export result (as parquet blobs inside a pickle)
+
+        st.download_button(
+            "Download result (parquet bundle)",
+            data=result_to_parquet_bytes(res),
+            file_name="simulation_result_parquet_bundle.pkl",
+            mime="application/octet-stream",
+        )
+
+
+# -----------------------------
+# Page 5: Compare & Export
+# -----------------------------
+
+if page.startswith("5"):
+    st.title("5) Compare & Export")
+
+    runs = st.session_state.runs
+    if not runs:
+        st.info("No runs yet. Run at least one simulation in Page 4.")
+        st.stop()
+
+    st.subheader("Run history")
+    run_names = [r["name"] for r in runs]
+    pick = st.multiselect("Select runs to compare", options=run_names, default=[run_names[-1]])
+
+    picked = [r for r in runs if r["name"] in set(pick)]
+    if not picked:
+        st.warning("Select at least one run.")
+        st.stop()
+
+    st.subheader("Overlay portfolio curves")
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for r in picked:
+        res = r["result"]
+        label = r["name"]
+        # pick primary series
+        df = None
+        for k in ("with_cash", "no_cash", "strategy"):
+            if k in res and isinstance(res[k], pd.DataFrame):
+                df = res[k]
+                break
+        if df is None:
+            continue
+        if "Portfolio Value" in df.columns:
+            s = df["Portfolio Value"].copy()
+        elif "Ensemble Mean" in df.columns:
+            s = df["Ensemble Mean"].copy()
+        else:
+            continue
+        base = s.dropna().iloc[0] if s.dropna().size else np.nan
+        s = (s / base - 1.0) * 100.0 if np.isfinite(base) and base != 0 else s * np.nan
+        ax.plot(s.index, s.values, label=label)
+
+    ax.set_title("Overlay returns (%)")
+    ax.set_ylabel("Return (%)")
+    ax.set_xlabel("Date")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(loc="best")
+    for lbl in ax.get_xticklabels():
+        lbl.set_rotation(90)
+        lbl.set_ha("center")
+        lbl.set_va("top")
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+    st.subheader("Export run configs")
+    export_payload = {
+        "runs": [
+            {
+                "name": r["name"],
+                "sim_cfg": r.get("sim_cfg"),
+                "event_cfg": r.get("event_cfg"),
+            }
+            for r in picked
+        ]
+    }
+    st.download_button(
+        "Download configs.json",
+        data=json.dumps(export_payload, indent=2, default=str).encode("utf-8"),
+        file_name="run_configs.json",
+        mime="application/json",
+    )
