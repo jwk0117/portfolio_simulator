@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import io
 import json
+import uuid
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -95,6 +96,8 @@ _ss_init("analysis_summary", None)     # pd.DataFrame
 _ss_init("runs", [])                   # list of run dicts
 _ss_init("event_shift_days", 0)        # event time shift in calendar days
 _ss_init("monte_carlo_result", None)   # Monte Carlo null distribution result
+_ss_init("run_name_draft", "")         # optional user-provided run name
+_ss_init("_clear_run_name_draft", False)  # internal flag to clear text_input safely on next rerun
 
 
 def _safe_str_list(text: str) -> Optional[List[str]]:
@@ -107,6 +110,26 @@ def _safe_str_list(text: str) -> Optional[List[str]]:
         if s:
             items.append(s)
     return items or None
+
+
+def _make_unique_run_name(desired: str, existing: Sequence[str]) -> str:
+    """Ensure a user-visible run name is unique among existing names.
+
+    If desired is empty/whitespace, the caller should provide a default.
+    If desired already exists, append " (2)", " (3)", ...
+    """
+    base = str(desired).strip()
+    if not base:
+        base = "Run"
+    existing_set = set(map(str, existing or []))
+    if base not in existing_set:
+        return base
+    i = 2
+    while True:
+        cand = f"{base} ({i})"
+        if cand not in existing_set:
+            return cand
+        i += 1
 
 
 def _sheet_selector_ui(sheet_items: Sequence[SheetItem]) -> List[SheetItem]:
@@ -593,6 +616,22 @@ if page.startswith("4"):
         effective_events = events
 
     st.subheader("Run simulation")
+
+    # Clear the draft run name on the next rerun (safe pattern for Streamlit widgets).
+    # Streamlit raises if you mutate a widget-backed key after the widget is instantiated.
+    if st.session_state.get("_clear_run_name_draft", False):
+        st.session_state["run_name_draft"] = ""
+        st.session_state["_clear_run_name_draft"] = False
+
+    # Optional: user-defined name for this run (used for Page 5 comparisons)
+    st.text_input(
+        "Run name (optional)",
+        key="run_name_draft",
+        help=(
+            "Provide a descriptive label for this simulation run (e.g., 'Top10 weekly, margin=1.5, SPY hedge'). "
+            "If omitted, an automatic Run N name is used. Names are auto-deduplicated if reused."
+        ),
+    )
     
     # Check if Monte Carlo is enabled
     mc_enabled = st.session_state.get("mc_enabled", False)
@@ -605,8 +644,15 @@ if page.startswith("4"):
     if st.button("Run"):
         import traceback
 
+        existing_names = [r.get("name", "") for r in (st.session_state.runs or [])]
+        desired_name = str(st.session_state.get("run_name_draft", "") or "").strip()
+        default_name = f"Run {len(existing_names) + 1}"
+        final_name = _make_unique_run_name(desired_name or default_name, existing_names)
+        run_id = str(uuid.uuid4())
+
         run_record: Dict[str, Any] = {
-            "name": f"Run {len(st.session_state.runs) + 1}",
+            "run_id": run_id,
+            "name": final_name,
             "sim_cfg": asdict(scfg),
             "event_cfg": asdict(st.session_state.event_cfg) if st.session_state.event_cfg else None,
             "analysis_summary": None,
@@ -679,6 +725,9 @@ if page.startswith("4"):
         finally:
             # Always store the attempt in run history so Page 5 can see it.
             st.session_state.runs.append(run_record)
+            # Clear the draft name after each run attempt to reduce accidental reuse.
+            # Do this on the *next* rerun to avoid mutating a widget-backed key post-instantiation.
+            st.session_state["_clear_run_name_draft"] = True
 
     res = st.session_state.result
     sim = st.session_state.sim
@@ -916,6 +965,7 @@ if page.startswith("5"):
     if (not runs) and (isinstance(st.session_state.get("result"), dict)):
         st.session_state.runs.append(
             {
+                "run_id": str(uuid.uuid4()),
                 "name": "Run 1",
                 "sim_cfg": asdict(st.session_state.sim_cfg) if st.session_state.sim_cfg else None,
                 "event_cfg": asdict(st.session_state.event_cfg) if st.session_state.event_cfg else None,
@@ -933,53 +983,84 @@ if page.startswith("5"):
         st.stop()
 
     st.subheader("Run history")
-    run_names = [r["name"] for r in runs]
-    pick = st.multiselect("Select runs to compare", options=run_names, default=[run_names[-1]])
 
-    picked = [r for r in runs if r["name"] in set(pick)]
+    ok_runs = [
+        r for r in (runs or [])
+        if bool(r.get("ok", False)) and isinstance(r.get("result"), dict)
+    ]
+    if not ok_runs:
+        st.info("No successful runs yet. Run at least one simulation in Page 4.")
+        # Still allow config export if there are failed attempts
+        st.stop()
+
+    run_names = [str(r.get("name", "Run")) for r in ok_runs]
+    pick = st.multiselect(
+        "Select runs to compare",
+        options=run_names,
+        default=run_names,  # include all so legend toggles work for every stored run
+    )
+
+    picked = [r for r in ok_runs if str(r.get("name", "")) in set(pick)]
     if not picked:
         st.warning("Select at least one run.")
         st.stop()
 
-    st.subheader("Overlay portfolio curves")
-    fig, ax = plt.subplots(figsize=(11, 5))
-    for r in picked:
-        res = r["result"]
-        label = r["name"]
-        # pick primary series
-        df = None
-        for k in ("with_cash", "no_cash", "strategy"):
-            if k in res and isinstance(res[k], pd.DataFrame):
-                df = res[k]
-                break
-        if df is None:
-            continue
-        if "Portfolio Value" in df.columns:
-            s = df["Portfolio Value"].copy()
-        elif "Ensemble Mean" in df.columns:
-            s = df["Ensemble Mean"].copy()
-        else:
-            continue
-        base = s.dropna().iloc[0] if s.dropna().size else np.nan
-        s = (s / base - 1.0) * 100.0 if np.isfinite(base) and base != 0 else s * np.nan
-        ax.plot(s.index, s.values, label=label)
+    st.subheader("Overlay portfolio curves (interactive)")
 
-    ax.set_title("Overlay returns (%)")
-    ax.set_ylabel("Return (%)")
-    ax.set_xlabel("Date")
-    ax.grid(True, axis="y", alpha=0.25)
-    ax.legend(loc="best")
-    for lbl in ax.get_xticklabels():
-        lbl.set_rotation(90)
-        lbl.set_ha("center")
-        lbl.set_va("top")
-    st.pyplot(fig, width="stretch")
-    plt.close(fig)
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        y_as = st.selectbox("Y-axis", ["pct", "value", "index", "log"], index=0)
+    with c2:
+        show_bench = st.checkbox("Benchmarks", value=True)
+
+    try:
+        fig = pgp.make_comparison_figure(
+            runs=picked,
+            y_as=y_as,
+            show_benchmarks=bool(show_bench),
+            title="",
+            template="plotly_dark",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Interactive comparison plot failed: {e}")
+
+    st.subheader("Download performance summaries (runs + benchmarks)")
+    summary_rows: List[pd.DataFrame] = []
+    for r in picked:
+        summ = r.get("analysis_summary", None)
+        if not isinstance(summ, pd.DataFrame):
+            try:
+                res = r.get("result", None)
+                if isinstance(res, dict):
+                    summ = analyze_result(res)
+                    r["analysis_summary"] = summ
+            except Exception:
+                summ = None
+
+        if isinstance(summ, pd.DataFrame) and not summ.empty:
+            tmp = summ.copy().reset_index().rename(columns={"Series": "Series"})
+            tmp.insert(0, "run_id", str(r.get("run_id", "")))
+            tmp.insert(1, "run_name", str(r.get("name", "Run")))
+            summary_rows.append(tmp)
+
+    if summary_rows:
+        summary_all = pd.concat(summary_rows, axis=0, ignore_index=True)
+        st.dataframe(summary_all, width="stretch")
+        st.download_button(
+            "Download performance_summaries.csv",
+            data=summary_all.to_csv(index=False).encode("utf-8"),
+            file_name="performance_summaries.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No performance summaries available for the selected runs.")
 
     st.subheader("Export run configs")
     export_payload = {
         "runs": [
             {
+                "run_id": r.get("run_id"),
                 "name": r["name"],
                 "sim_cfg": r.get("sim_cfg"),
                 "event_cfg": r.get("event_cfg"),

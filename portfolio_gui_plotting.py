@@ -294,6 +294,125 @@ def make_performance_figure(
     return fig
 
 
+def make_comparison_figure(
+    *,
+    runs: "list[dict]",
+    y_as: str = "pct",
+    show_benchmarks: bool = True,
+    title: Optional[str] = None,
+    template: str = "plotly_dark",
+) -> "object":
+    """Build an interactive Plotly figure overlaying multiple stored runs.
+
+    Parameters
+    ----------
+    runs : list[dict]
+        List of run records (as stored in st.session_state.runs). Each run record
+        is expected to include at least:
+          - "name": display label
+          - "result": dict[str, DataFrame] simulation result
+        If a run is missing a usable strategy series, it is skipped.
+    y_as : {"pct", "value", "index", "log"}
+        Output scale (consistent with make_performance_figure).
+    show_benchmarks : bool
+        If True, include benchmark traces (added once, sourced from the first
+        run that contains a non-empty "benchmarks" frame).
+    title : str | None
+        Figure title. If None, defaults to empty.
+    template : str
+        Plotly template name.
+    """
+    go, _ = _import_plotly()
+    if go is None:
+        raise ImportError("Plotly is not available")
+
+    if title is None:
+        title = ""
+
+    fig = go.Figure()
+
+    # Add each run trace
+    for r in runs or []:
+        res = r.get("result", None)
+        if not isinstance(res, dict):
+            continue
+
+        try:
+            _, df = _pick_strategy_df(res)
+        except Exception:
+            continue
+
+        # Select a representative series
+        if _is_ensemble_df(df):
+            if "Ensemble Mean" not in df.columns:
+                continue
+            s = _reexpress_series(df["Ensemble Mean"], y_as)
+        else:
+            if "Portfolio Value" not in df.columns:
+                continue
+            s = _reexpress_series(df["Portfolio Value"], y_as)
+
+        label = str(r.get("name", "Run"))
+        fig.add_trace(
+            go.Scatter(
+                x=s.index,
+                y=s.values,
+                mode="lines",
+                name=label,
+                hovertemplate="%{x|%Y-%m-%d}<br>%{y:.2f}<extra></extra>",
+            )
+        )
+
+    # Benchmarks (added once)
+    if show_benchmarks:
+        bench_df = None
+        for r in runs or []:
+            res = r.get("result", None)
+            if isinstance(res, dict):
+                b = res.get("benchmarks", None)
+                if isinstance(b, pd.DataFrame) and not b.empty:
+                    bench_df = b
+                    break
+
+        if isinstance(bench_df, pd.DataFrame) and not bench_df.empty:
+            for col in bench_df.columns:
+                try:
+                    bs = _reexpress_series(bench_df[col], y_as)
+                except Exception:
+                    continue
+                fig.add_trace(
+                    go.Scatter(
+                        x=bs.index,
+                        y=bs.values,
+                        mode="lines",
+                        name=f"Benchmark: {col}",
+                        line=dict(width=1),
+                        hovertemplate="%{x|%Y-%m-%d}<br>%{y:.2f}<extra></extra>",
+                    )
+                )
+
+    ytitle = {
+        "value": "Portfolio Value",
+        "pct": "Return (%)",
+        "index": "Index (Base=100)",
+        "log": "Portfolio Value (log)",
+    }[str(y_as).lower().strip()]
+
+    fig.update_layout(
+        template=template,
+        title=title,
+        xaxis_title="Date",
+        yaxis_title=ytitle,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=40, r=20, t=20 if not title else 50, b=40),
+    )
+    if str(y_as).lower().strip() == "log":
+        fig.update_yaxes(type="log")
+
+    return fig
+
+
 def make_holdings_heatmap_figure(
     *,
     result: Dict[str, pd.DataFrame],
