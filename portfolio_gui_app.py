@@ -944,7 +944,7 @@ if page.startswith("5"):
         lbl.set_rotation(90)
         lbl.set_ha("center")
         lbl.set_va("top")
-    st.pyplot(fig, width="stretch")
+    st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
     st.subheader("Export run configs")
