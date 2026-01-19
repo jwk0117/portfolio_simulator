@@ -48,6 +48,7 @@ from portfolio_gui_core import (
     dump_events_json,
     infer_sim_date_range_from_events,
     make_simulation,
+    normalize_sheets,
     result_to_parquet_bytes,
     run_simulation,
     shift_events_by_calendar_days,
@@ -110,6 +111,31 @@ def _safe_str_list(text: str) -> Optional[List[str]]:
         if s:
             items.append(s)
     return items or None
+
+
+def _natural_sort_key(val: Any):
+    """Human-friendly alphanumeric sort key ("natural" ordering).
+
+    This makes dropdowns easier to scan when tickers contain digits.
+    """
+    import re
+
+    try:
+        txt = str(val)
+    except Exception:
+        txt = ""
+
+    parts = re.split(r"(\d+)", txt)
+    key: List[Any] = []
+    for p in parts:
+        if p.isdigit():
+            try:
+                key.append(int(p))
+            except Exception:
+                key.append(p)
+        else:
+            key.append(p.lower())
+    return tuple(key)
 
 
 def _make_unique_run_name(desired: str, existing: Sequence[str]) -> str:
@@ -810,6 +836,141 @@ if page.startswith("4"):
                 st.plotly_chart(fig_hm, use_container_width=True)
             except Exception as e:
                 st.error(f"Holdings heatmap failed: {e}")
+
+            # -------------------------
+            # Selection metric trajectories (overlay)
+            # -------------------------
+            st.markdown("---")
+            st.subheader("Selection Metric Trajectories")
+            st.caption(
+                "Each ticker is a colored line+markers trace showing its selection metric (e.g., Master Rank) at each event. "
+                "Lines break automatically when a ticker is absent from an intermediate event. Hover any point to see the ticker."
+            )
+
+            detail_df = st.session_state.get("events_detail", None)
+            if not isinstance(detail_df, pd.DataFrame) or detail_df.empty:
+                st.info("No event selection detail available. Re-build events on Page 2 to enable this plot.")
+            else:
+                # Trajectory controls (always visible)
+                event_cfg = st.session_state.get("event_cfg", None)
+                default_traj_n = 20
+                try:
+                    if event_cfg is not None and getattr(event_cfg, "top_n", None) is not None:
+                        default_traj_n = max(20, int(getattr(event_cfg, "top_n")))
+                except Exception:
+                    pass
+
+                col_a, col_b, col_c = st.columns([1, 1, 2])
+                with col_a:
+                    traj_top_n = st.number_input(
+                        "Rank window (Top N to display)",
+                        min_value=1,
+                        max_value=2000,
+                        value=int(default_traj_n),
+                        step=1,
+                        help=(
+                            "Controls the rank-range visualized in the trajectory plot. "
+                            "This can be larger than the Top-N used to *select* holdings when building events."
+                        ),
+                    )
+                with col_b:
+                    invert_y = st.checkbox(
+                        "Invert Y-axis (lower rank is better)",
+                        value=True,
+                        help="Common for rank-like metrics such as Master Rank.",
+                    )
+
+                # Recompute a Top-N ranking window for plotting if possible.
+                # This allows viewing trajectories within a larger Top-N than was used for event selection.
+                traj_detail_df = detail_df
+                try:
+                    sheets_all = st.session_state.get("sheets", [])
+                    sheet_table = st.session_state.get("sheet_table", None)
+
+                    if event_cfg is not None and sheets_all:
+                        # Reconstruct the selected/ordered sheets (same logic as Page 2 / Monte Carlo).
+                        if sheet_table is not None:
+                            use = sheet_table[sheet_table["Use"] == True].copy()  # noqa: E712
+                            use = use.sort_values(["Order", "Name"], ascending=[True, True])
+                            names = use["Name"].tolist()
+                            selected_sheets = [s for s in sheets_all if s.name in set(names)]
+                            selected_sheets = sorted(selected_sheets, key=lambda s: names.index(s.name))
+                        else:
+                            selected_sheets = sheets_all
+
+                        sheets_norm = normalize_sheets(
+                            selected_sheets,
+                            ticker_col=str(event_cfg.ticker_col),
+                            datetime_col=str(event_cfg.datetime_col),
+                            ordering_col=str(event_cfg.ordering_col),
+                            weight_col=getattr(event_cfg, "weight_col", None),
+                        )
+
+                        # Use the engine builder to get a *detail* table for the Top-N window.
+                        # Avoid yfinance metadata lookups (lookup_meta=False) and summary computation.
+                        _, traj_detail_df = ps.build_events_from_sheets(
+                            sheets_norm,
+                            column=str(event_cfg.ordering_col),
+                            direction=str(event_cfg.direction),
+                            top_n=int(traj_top_n),
+                            group_col="datetime",
+                            weight_mode="equal",
+                            weight_column=None,
+                            softmax_tau=float(getattr(event_cfg, "softmax_tau", 1.0)),
+                            min_weight=float(getattr(event_cfg, "min_weight", 0.0)),
+                            max_weight=None,
+                            round_weights=getattr(event_cfg, "round_weights", None),
+                            include=getattr(event_cfg, "include", None),
+                            exclude=getattr(event_cfg, "exclude", None),
+                            dedupe=str(getattr(event_cfg, "dedupe", "first")),
+                            tie_breaker=str(getattr(event_cfg, "tie_breaker", "stable")),
+                            random_state=getattr(event_cfg, "random_state", None),
+                            return_detail=True,
+                            return_summary=False,
+                            lookup_meta=False,
+                        )
+                except Exception as e:
+                    st.warning(
+                        f"Trajectory plot: could not compute the Top-{int(traj_top_n)} window from sheets; "
+                        f"falling back to stored selection detail. Error: {e}"
+                    )
+                    traj_detail_df = detail_df
+
+                # Focus ticker dropdown: sort alphanumerically for easier scanning.
+                try:
+                    tickers_all = traj_detail_df["yf_Ticker"].astype(str).dropna().unique().tolist()
+                except Exception:
+                    tickers_all = []
+                tickers_sorted = sorted(tickers_all, key=_natural_sort_key)
+                focus_options = ["(none)"] + tickers_sorted
+
+                with col_c:
+                    focus_choice = st.selectbox(
+                        "Focus ticker (optional)",
+                        options=focus_options,
+                        index=0,
+                        help="Emphasize one ticker trace (others are dimmed).",
+                    )
+
+                try:
+                    metric_name = None
+                    try:
+                        metric_name = st.session_state.event_cfg.ordering_col if st.session_state.event_cfg else None
+                    except Exception:
+                        metric_name = None
+
+                    fig_traj = pgp.make_rank_trajectory_overlay_figure(
+                        events_detail=traj_detail_df,
+                        events=effective_events,
+                        metric_column=metric_name,
+                        max_tickers=None,
+                        focus_ticker=None if focus_choice == "(none)" else str(focus_choice),
+                        invert_y=bool(invert_y),
+                        template="plotly_dark",
+                    )
+                    st.plotly_chart(fig_traj, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Trajectory plot failed: {e}")
 
         # -------------------------
         # Tab 2: Monte Carlo Analysis

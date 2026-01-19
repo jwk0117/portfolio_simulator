@@ -6,7 +6,7 @@ still run with Matplotlib fallback if Plotly is not installed.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -520,6 +520,190 @@ def make_holdings_heatmap_figure(
     fig.update_xaxes(tickangle=90, row=1, col=1)
     fig.update_yaxes(title_text=f"Selection order by: {ordering_label}", row=1, col=1)
     fig.update_xaxes(title_text="Avg Return (%)", row=1, col=2)
+
+    # Invert y-axis so that lower ranks (e.g., 1) appear at the top.
+    # Apply to both the heatmap panel and the avg-bar panel so the rank
+    # ordering is consistent across columns.
+    fig.update_yaxes(
+        autorange="reversed",
+        categoryorder="array",
+        categoryarray=y_labels,
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(
+        autorange="reversed",
+        categoryorder="array",
+        categoryarray=y_labels,
+        row=1,
+        col=2,
+    )
+
+    return fig
+
+
+def make_rank_trajectory_overlay_figure(
+    *,
+    events_detail: pd.DataFrame,
+    events: Sequence[Any],
+    metric_column: Optional[str] = None,
+    max_tickers: Optional[int] = None,
+    focus_ticker: Optional[str] = None,
+    invert_y: bool = True,
+    template: str = "plotly_dark",
+) -> "object":
+    """Overlay plot of per-ticker selection metric across event times.
+
+    This is intended for the GUI "4) Run & Analyze" page, as a companion to the
+    holdings heatmap. Each ticker is a colored line+markers trace.
+
+    Key behavior: If a ticker is absent at an intermediate event time and later
+    re-enters, the line should NOT connect across the missing period. This is
+    achieved by inserting None values at missing event times.
+
+    Parameters
+    ----------
+    events_detail : pd.DataFrame
+        Output from build_events(..., return_detail=True) stored in session_state
+        as events_detail. Expected columns: ['datetime', 'yf_Ticker', 'metric_value'].
+    events : Sequence
+        The (possibly shifted) events used for the simulation. Used to define the
+        x-axis event times.
+    metric_column : str, optional
+        Label for the y-axis. If None, will attempt to infer from events_detail.
+    max_tickers : int, optional
+        Optional cap on the number of tickers plotted (chosen by frequency of appearance).
+        If None, all available tickers in events_detail are plotted.
+    focus_ticker : str, optional
+        If provided, visually emphasize this ticker and dim others.
+    invert_y : bool
+        If True, reverse the y-axis (useful when a lower rank is "better").
+    template : str
+        Plotly template.
+    """
+    go, _ = _import_plotly()
+    if go is None:
+        raise ImportError("Plotly is not available")
+
+    if not isinstance(events_detail, pd.DataFrame) or events_detail.empty:
+        raise ValueError("events_detail is required and must not be empty")
+
+    required = {"datetime", "yf_Ticker", "metric_value"}
+    missing = required - set(events_detail.columns)
+    if missing:
+        raise KeyError(f"events_detail missing required columns: {sorted(missing)}")
+
+    df = events_detail.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    df = df.dropna(subset=["datetime", "yf_Ticker"]).copy()
+    if df.empty:
+        raise ValueError("events_detail has no usable rows after cleaning")
+
+    # Determine x-axis event dates from the provided events.
+    event_dates: List[pd.Timestamp] = []
+    for e in (events or []):
+        try:
+            d = pd.Timestamp(getattr(e, "date", e)).tz_localize(None).normalize()
+        except Exception:
+            continue
+        event_dates.append(d)
+    # De-duplicate while preserving order
+    seen = set()
+    event_dates = [d for d in event_dates if not (d in seen or seen.add(d))]
+
+    # If the provided events length matches the unique detail datetimes, align by position.
+    # This is important when the GUI shifts events by a fixed number of days.
+    detail_dates = sorted(df["datetime"].dropna().unique())
+    if len(event_dates) == len(detail_dates) and len(event_dates) > 0:
+        date_map = {pd.Timestamp(o): pd.Timestamp(n) for o, n in zip(detail_dates, event_dates)}
+        df["datetime"] = df["datetime"].map(lambda x: date_map.get(pd.Timestamp(x), pd.Timestamp(x)))
+        x_dates = event_dates
+    else:
+        # Fall back to the datetimes present in the detail dataframe.
+        x_dates = detail_dates
+
+    # Infer metric label when possible
+    if metric_column is None:
+        if "metric_column" in df.columns:
+            uniq = [str(x) for x in df["metric_column"].dropna().unique()]
+            metric_column = uniq[0] if len(uniq) == 1 else (uniq[0] if uniq else "Selection metric")
+        else:
+            metric_column = "Selection metric"
+    metric_label = str(metric_column)
+
+    # Choose tickers to plot by frequency across events (most common first)
+    counts = df["yf_Ticker"].astype(str).value_counts()
+    tickers = counts.index.tolist()
+    if max_tickers is not None:
+        try:
+            k = int(max_tickers)
+        except Exception:
+            k = None
+        if k is not None and k > 0 and len(tickers) > k:
+            tickers = tickers[:k]
+    if focus_ticker is not None and str(focus_ticker).strip() != "":
+        ft = str(focus_ticker).strip()
+        if ft not in tickers and ft in counts.index:
+            tickers = [ft] + tickers
+
+    # Precompute a date->metric mapping per ticker.
+    # If duplicates exist for (datetime, ticker), take the mean.
+    df["yf_Ticker"] = df["yf_Ticker"].astype(str)
+    df["metric_value"] = pd.to_numeric(df["metric_value"], errors="coerce")
+    df = df.dropna(subset=["metric_value"]).copy()
+
+    fig = go.Figure()
+    x = x_dates
+
+    # Styling: allow a "focus" ticker to be emphasized
+    focus = str(focus_ticker).strip() if (focus_ticker is not None and str(focus_ticker).strip()) else None
+
+    # Base opacity/width
+    base_opacity = 0.35 if focus is None else 0.12
+    base_width = 1.0
+    base_ms = 5
+    focus_opacity = 1.0
+    focus_width = 3.5
+    focus_ms = 7
+
+    for t in tickers:
+        dsub = df.loc[df["yf_Ticker"] == t, ["datetime", "metric_value"]]
+        if dsub.empty:
+            continue
+        s = dsub.groupby("datetime")["metric_value"].mean()
+        s = s.reindex(x)
+        y = [None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v) for v in s.values]
+
+        is_focus = (focus is not None and t == focus)
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="lines+markers",
+                connectgaps=False,
+                showlegend=False,
+                name=t,
+                opacity=(focus_opacity if is_focus else base_opacity),
+                line=dict(width=(focus_width if is_focus else base_width)),
+                marker=dict(size=(focus_ms if is_focus else base_ms)),
+                customdata=[t] * len(x),
+                hovertemplate=(
+                    "Ticker: %{customdata}<br>"
+                    "Event: %{x|%Y-%m-%d}<br>"
+                    f"{metric_label}: %{{y:.2f}}<extra></extra>"
+                ),
+            )
+        )
+
+    fig.update_layout(
+        template=template,
+        margin=dict(l=50, r=20, t=30, b=60),
+        hovermode="closest",
+        xaxis_title="Event date (each sheet)",
+        yaxis_title=metric_label,
+    )
+    if invert_y:
+        fig.update_yaxes(autorange="reversed")
 
     return fig
 
