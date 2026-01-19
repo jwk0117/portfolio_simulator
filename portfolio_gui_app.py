@@ -49,6 +49,8 @@ from portfolio_gui_core import (
     make_simulation,
     result_to_parquet_bytes,
     run_simulation,
+    shift_events_by_calendar_days,
+    run_monte_carlo_null_distribution,
 )
 
 
@@ -91,6 +93,8 @@ _ss_init("sim", None)                  # Simulation
 _ss_init("result", None)               # dict[str, DataFrame]
 _ss_init("analysis_summary", None)     # pd.DataFrame
 _ss_init("runs", [])                   # list of run dicts
+_ss_init("event_shift_days", 0)        # event time shift in calendar days
+_ss_init("monte_carlo_result", None)   # Monte Carlo null distribution result
 
 
 def _safe_str_list(text: str) -> Optional[List[str]]:
@@ -169,7 +173,15 @@ def _pick_columns_ui(sheet_items: Sequence[SheetItem]) -> Dict[str, str]:
     datetime_col = st.selectbox("Datetime column", options=cols, index=cols.index(cands["datetime"][0]) if cands["datetime"] and cands["datetime"][0] in cols else 0)
 
     numeric_cols = cands["numeric"] if cands["numeric"] else cols
-    ordering_col = st.selectbox("Ordering metric column", options=numeric_cols, index=0)
+    
+    # Default to "Master Rank" if available, otherwise first numeric column
+    ordering_default_idx = 0
+    for i, col in enumerate(numeric_cols):
+        if col == "Master Rank":
+            ordering_default_idx = i
+            break
+    
+    ordering_col = st.selectbox("Ordering metric column", options=numeric_cols, index=ordering_default_idx)
 
     weight_col = st.selectbox(
         "Weight column (optional)",
@@ -413,10 +425,45 @@ if page.startswith("3"):
     d0, d1 = infer_sim_date_range_from_events(events)
     st.caption(f"Default date range inferred from events: {d0.date()} to {d1.date()}")
 
+    # -------------------------
+    # Event Time Shifting
+    # -------------------------
+    st.subheader("Event Time Shifting")
+    st.caption("Shift all event dates by a fixed number of calendar days. Dates landing on weekends/holidays are moved to the next NYSE trading day.")
+    
+    shift_col1, shift_col2 = st.columns([2, 1])
+    with shift_col1:
+        event_shift_days = st.slider(
+            "Shift events by (calendar days)",
+            min_value=-60,
+            max_value=60,
+            value=int(st.session_state.event_shift_days),
+            step=1,
+            help="Positive = shift into future, Negative = shift into past"
+        )
+    with shift_col2:
+        if event_shift_days != 0:
+            st.info(f"Events will be shifted by **{event_shift_days:+d}** days")
+        else:
+            st.success("No shift applied")
+    
+    st.session_state.event_shift_days = event_shift_days
+    
+    # Apply shift to get effective events for simulation
+    if event_shift_days != 0:
+        effective_events = shift_events_by_calendar_days(events, event_shift_days, snap_to_trading_day=True)
+        d0_eff, d1_eff = infer_sim_date_range_from_events(effective_events)
+        st.caption(f"Effective date range after shift: {d0_eff.date()} to {d1_eff.date()}")
+    else:
+        effective_events = events
+        d0_eff, d1_eff = d0, d1
+    
+    st.markdown("---")
+
     col1, col2, col3 = st.columns(3)
     with col1:
-        start_date = st.date_input("Start date", value=d0.date())
-        end_date = st.date_input("End date", value=d1.date())
+        start_date = st.date_input("Start date", value=d0_eff.date())
+        end_date = st.date_input("End date", value=d1_eff.date())
         initial_capital = st.number_input("Initial capital", min_value=0.0, value=100000.0, step=1000.0, format="%.2f")
     with col2:
         cash_policy = st.selectbox("Cash policy", ["None", "fixed", "proportion"], index=0)
@@ -426,21 +473,33 @@ if page.startswith("3"):
         max_leverage = st.number_input("Max leverage", min_value=1.0, value=1.0, step=0.1, format="%.2f")
         margin_rate_apr = st.number_input("Margin APR (e.g., 0.05 = 5%)", min_value=0.0, value=0.0, step=0.01, format="%.4f")
         rebalance_mode = st.selectbox("Rebalance mode", ["adjust", "rebuild"], index=0)
-        use_adj_close = st.checkbox("Use Adj Close (Yahoo Adj Close)", value=False)
+        use_adj_close = st.checkbox("Use Adj Close (Yahoo Adj Close)", value=True)
 
-    st.subheader("Ensemble / randomization")
-    e1, e2, e3, e4 = st.columns(4)
-    with e1:
-        shuffle_events = st.checkbox("Shuffle events", value=False)
-        num_shuffle = st.number_input("# shuffles", min_value=1, value=100, step=10)
-    with e2:
-        shuffle_window_days = st.number_input("Shuffle window days (optional)", min_value=0.0, value=0.0, step=1.0, format="%.1f")
-        use_shuffle_window = st.checkbox("Enable shuffle window", value=False)
-    with e3:
-        weight_method = st.selectbox("Weight method", ["None", "random", "uniform"], index=0)
-    with e4:
-        use_seed = st.checkbox("Use random seed", value=False, key="sim_use_seed")
-        seed = st.number_input("Seed", min_value=0, value=0, step=1, key="sim_seed")
+    # -------------------------
+    # Shuffling section (commented out)
+    # -------------------------
+    # st.subheader("Ensemble / randomization")
+    # e1, e2, e3, e4 = st.columns(4)
+    # with e1:
+    #     shuffle_events = st.checkbox("Shuffle events", value=False)
+    #     num_shuffle = st.number_input("# shuffles", min_value=1, value=100, step=10)
+    # with e2:
+    #     shuffle_window_days = st.number_input("Shuffle window days (optional)", min_value=0.0, value=0.0, step=1.0, format="%.1f")
+    #     use_shuffle_window = st.checkbox("Enable shuffle window", value=False)
+    # with e3:
+    #     weight_method = st.selectbox("Weight method", ["None", "random", "uniform"], index=0)
+    # with e4:
+    #     use_seed = st.checkbox("Use random seed", value=False, key="sim_use_seed")
+    #     seed = st.number_input("Seed", min_value=0, value=0, step=1, key="sim_seed")
+    
+    # Default values for commented-out shuffling options
+    shuffle_events = False
+    num_shuffle = 100
+    shuffle_window_days = 0.0
+    use_shuffle_window = False
+    weight_method = "None"
+    use_seed = False
+    seed = 0
 
     st.subheader("Dollar-neutral overlay")
     dn1, dn2, dn3, dn4 = st.columns(4)
@@ -476,6 +535,36 @@ if page.startswith("3"):
     )
 
     st.session_state.sim_cfg = scfg
+    
+    # -------------------------
+    # Monte Carlo Null Distribution
+    # -------------------------
+    st.markdown("---")
+    st.subheader("Monte Carlo Null Distribution")
+    st.caption("Test how your strategy compares to randomly selecting stocks from your universe.")
+    
+    mc_col1, mc_col2, mc_col3, mc_col4 = st.columns(4)
+    with mc_col1:
+        run_monte_carlo = st.checkbox("Enable Monte Carlo", value=False, key="enable_mc")
+    with mc_col2:
+        mc_n_trials = st.number_input("Number of trials", min_value=10, max_value=1000, value=100, step=10)
+    with mc_col3:
+        event_cfg = st.session_state.event_cfg
+        default_n = event_cfg.top_n if event_cfg else 10
+        mc_n_stocks = st.number_input("Stocks per event", min_value=1, max_value=100, value=default_n, step=1,
+                                       help="Number of randomly selected stocks per event (default: same as your strategy)")
+    with mc_col4:
+        mc_seed = st.number_input("MC random seed", min_value=0, value=42, step=1)
+    
+    if run_monte_carlo:
+        st.info(f"Monte Carlo will run **{mc_n_trials}** trials, each selecting **{mc_n_stocks}** random stocks per event with equal weights.")
+    
+    # Store MC settings in session state
+    st.session_state.mc_enabled = run_monte_carlo
+    st.session_state.mc_n_trials = mc_n_trials
+    st.session_state.mc_n_stocks = mc_n_stocks
+    st.session_state.mc_seed = mc_seed
+    
     st.success("Simulation parameters saved in session. Proceed to '4) Run & Analyze'.")
 
 
@@ -495,18 +584,79 @@ if page.startswith("4"):
         st.warning("Set simulation parameters first (Page 3).")
         st.stop()
 
+    # Apply event time shift if configured
+    event_shift_days = st.session_state.get("event_shift_days", 0)
+    if event_shift_days != 0:
+        effective_events = shift_events_by_calendar_days(events, event_shift_days, snap_to_trading_day=True)
+        st.info(f"Events shifted by {event_shift_days:+d} calendar days")
+    else:
+        effective_events = events
+
     st.subheader("Run simulation")
+    
+    # Check if Monte Carlo is enabled
+    mc_enabled = st.session_state.get("mc_enabled", False)
+    if mc_enabled:
+        mc_n_trials = st.session_state.get("mc_n_trials", 100)
+        mc_n_stocks = st.session_state.get("mc_n_stocks", 10)
+        mc_seed = st.session_state.get("mc_seed", 42)
+        st.caption(f"Monte Carlo enabled: {mc_n_trials} trials, {mc_n_stocks} stocks/event")
+    
     if st.button("Run"):
         try:
-            sim = make_simulation(events, scfg)
+            # Run main strategy simulation
+            sim = make_simulation(effective_events, scfg)
             res = run_simulation(sim)
             summ = analyze_result(res)
-        except Exception as e:
-            st.error(f"Simulation failed: {e}")
-        else:
+            
             st.session_state.sim = sim
             st.session_state.result = res
             st.session_state.analysis_summary = summ
+            
+            # Run Monte Carlo if enabled
+            if mc_enabled:
+                sheets_all = st.session_state.sheets
+                event_cfg = st.session_state.event_cfg
+                
+                # Get selected sheets (same logic as page 2)
+                sheet_table = st.session_state.sheet_table
+                if sheet_table is not None:
+                    use = sheet_table[sheet_table["Use"] == True].copy()
+                    use = use.sort_values(["Order", "Name"], ascending=[True, True])
+                    names = use["Name"].tolist()
+                    selected_sheets = [s for s in sheets_all if s.name in set(names)]
+                    selected_sheets = sorted(selected_sheets, key=lambda s: names.index(s.name))
+                else:
+                    selected_sheets = sheets_all
+                
+                if selected_sheets and event_cfg:
+                    progress_bar = st.progress(0, text="Running Monte Carlo simulations...")
+                    
+                    def update_progress(current, total):
+                        progress_bar.progress(current / total, text=f"Monte Carlo: {current}/{total} trials")
+                    
+                    mc_result = run_monte_carlo_null_distribution(
+                        selected_sheets,
+                        event_cfg,
+                        scfg,
+                        n_trials=mc_n_trials,
+                        n_stocks=mc_n_stocks,
+                        random_state=mc_seed,
+                        progress_callback=update_progress,
+                    )
+                    
+                    st.session_state.monte_carlo_result = mc_result
+                    progress_bar.empty()
+                    st.success(f"Monte Carlo completed: {mc_result['n_trials']} successful trials")
+                else:
+                    st.warning("Could not run Monte Carlo - missing sheet data or event config")
+            else:
+                st.session_state.monte_carlo_result = None
+                
+        except Exception as e:
+            st.error(f"Simulation failed: {e}")
+            import traceback
+            st.code(traceback.format_exc())
 
             # Store in run history
             st.session_state.runs.append(
@@ -535,7 +685,7 @@ if page.startswith("4"):
         )
 
     if isinstance(res, dict) and sim is not None:
-        tabs = st.tabs(["Visualization - Performance", "Trades", "Data Health"])
+        tabs = st.tabs(["Visualization - Performance", "Monte Carlo Analysis", "Trades", "Data Health"])
 
         # -------------------------
         # Tab 1: Performance + Heatmap
@@ -551,6 +701,7 @@ if page.startswith("4"):
                 show_bench = st.checkbox("Benchmarks", value=True)
             with c3:
                 show_events = st.checkbox("Event markers (dots)", value=True)
+                show_mc_bands = st.checkbox("Show MC percentile bands", value=True) if st.session_state.monte_carlo_result else False
             with c4:
                 top_n = st.number_input("Heatmap slots (top N)", min_value=1, value=10, step=1)
                 hm_clip = st.number_input("Heatmap clip (abs %; 0=auto)", min_value=0.0, value=20.0, step=1.0)
@@ -558,6 +709,7 @@ if page.startswith("4"):
 
             if backend.startswith("Interactive"):
                 try:
+                    mc_result = st.session_state.monte_carlo_result if show_mc_bands else None
                     fig = pgp.make_performance_figure(
                         result=res,
                         sim=sim,
@@ -566,8 +718,9 @@ if page.startswith("4"):
                         show_events=bool(show_events),
                         title="",
                         template="plotly_dark",
+                        monte_carlo_result=mc_result,
                     )
-                    st.plotly_chart(fig, width="stretch")
+                    st.plotly_chart(fig, use_container_width=True)
                 except Exception as e:
                     st.error(f"Interactive plot failed; falling back to Matplotlib. Error: {e}")
                     backend = "Matplotlib"
@@ -582,7 +735,7 @@ if page.startswith("4"):
                 )
                 figs = _capture_matplotlib_figures(ps.plot_simulation, **plot_kwargs)
                 for fig in figs:
-                    st.pyplot(fig, clear_figure=False, width="stretch")
+                    st.pyplot(fig, clear_figure=False, use_container_width=True)
                     plt.close(fig)
 
             st.markdown("---")
@@ -594,14 +747,85 @@ if page.startswith("4"):
                     top_n=int(top_n),
                     clip=hm_clip,
                 )
-                st.plotly_chart(fig_hm, width="stretch")
+                st.plotly_chart(fig_hm, use_container_width=True)
             except Exception as e:
                 st.error(f"Holdings heatmap failed: {e}")
 
         # -------------------------
-        # Tab 2: Trades
+        # Tab 2: Monte Carlo Analysis
         # -------------------------
         with tabs[1]:
+            st.subheader("Monte Carlo Null Distribution Analysis")
+            
+            mc_result = st.session_state.monte_carlo_result
+            if mc_result is None:
+                st.info("Monte Carlo analysis not enabled. Enable it in Page 3 (Simulation Parameters) and re-run.")
+            else:
+                st.success(f"Completed {mc_result['n_trials']} random selection trials")
+                
+                # Get strategy's final return for comparison
+                strat_final_return = None
+                try:
+                    _, strat_df = pgp._pick_strategy_df(res)
+                    if "Portfolio Value" in strat_df.columns:
+                        pv = strat_df["Portfolio Value"].dropna()
+                        if len(pv) > 0:
+                            strat_final_return = (pv.iloc[-1] / pv.iloc[0] - 1.0) * 100.0
+                    elif "Ensemble Mean" in strat_df.columns:
+                        pv = strat_df["Ensemble Mean"].dropna()
+                        if len(pv) > 0:
+                            strat_final_return = (pv.iloc[-1] / pv.iloc[0] - 1.0) * 100.0
+                except Exception:
+                    pass
+                
+                # Summary statistics
+                final_returns = mc_result["final_returns_pct"]
+                if final_returns:
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("MC Mean Return", f"{np.mean(final_returns):.2f}%")
+                        st.metric("MC Median Return", f"{np.median(final_returns):.2f}%")
+                    with col2:
+                        st.metric("MC Std Dev", f"{np.std(final_returns):.2f}%")
+                        st.metric("MC Min Return", f"{np.min(final_returns):.2f}%")
+                    with col3:
+                        st.metric("MC Max Return", f"{np.max(final_returns):.2f}%")
+                        if strat_final_return is not None:
+                            # Calculate percentile rank
+                            pct_rank = (np.array(final_returns) < strat_final_return).mean() * 100
+                            st.metric("Your Strategy Percentile", f"{pct_rank:.1f}%",
+                                     help="Percentage of random trials your strategy beat")
+                
+                # Histogram
+                st.markdown("#### Distribution of Random Strategy Returns")
+                try:
+                    fig_hist = pgp.make_monte_carlo_histogram(
+                        mc_result,
+                        strategy_return=strat_final_return,
+                        title="",
+                    )
+                    st.plotly_chart(fig_hist, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Histogram failed: {e}")
+                
+                # Show strategy return vs null distribution
+                if strat_final_return is not None:
+                    st.markdown("#### Your Strategy vs Random Selection")
+                    pct_rank = (np.array(final_returns) < strat_final_return).mean() * 100
+                    
+                    if pct_rank >= 95:
+                        st.success(f"🎯 Your strategy return ({strat_final_return:.2f}%) is in the **top {100-pct_rank:.1f}%** of random selections!")
+                    elif pct_rank >= 75:
+                        st.info(f"📈 Your strategy return ({strat_final_return:.2f}%) beats **{pct_rank:.1f}%** of random selections.")
+                    elif pct_rank >= 50:
+                        st.warning(f"📊 Your strategy return ({strat_final_return:.2f}%) is **above median** (beats {pct_rank:.1f}% of random).")
+                    else:
+                        st.error(f"📉 Your strategy return ({strat_final_return:.2f}%) is **below median** (beats only {pct_rank:.1f}% of random).")
+
+        # -------------------------
+        # Tab 3: Trades
+        # -------------------------
+        with tabs[2]:
             st.subheader("Trade Log")
             trades_df = None
             if isinstance(res.get("trades"), pd.DataFrame):
@@ -614,7 +838,7 @@ if page.startswith("4"):
             if trades_df is None or trades_df.empty:
                 st.info("No trade log available in this result")
             else:
-                st.dataframe(trades_df, width="stretch")
+                st.dataframe(trades_df, use_container_width=True)
                 st.download_button(
                     "Download trades.csv",
                     data=trades_df.to_csv(index=False).encode("utf-8"),
@@ -623,9 +847,9 @@ if page.startswith("4"):
                 )
 
         # -------------------------
-        # Tab 3: Data Health
+        # Tab 4: Data Health
         # -------------------------
-        with tabs[2]:
+        with tabs[3]:
             st.subheader("Data Health")
             dh = res.get("data_health", None)
             if not isinstance(dh, pd.DataFrame) or dh.empty:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 
@@ -63,6 +64,7 @@ def make_performance_figure(
     show_events: bool = True,
     title: Optional[str] = None,
     template: str = "plotly_dark",
+    monte_carlo_result: Optional[Dict] = None,
 ) -> "object":
     """Interactive performance plot (Plotly).
 
@@ -71,6 +73,8 @@ def make_performance_figure(
     - Event markers are rendered as dots on the primary strategy curve at the
       first trading day on/after each event date (matching Simulation's trigger logic).
     - The Plotly figure is styled with a dark template by default.
+    - If monte_carlo_result is provided, percentile bands from random selection
+      trials are shown as a shaded region.
     """
     go, _ = _import_plotly()
     if go is None:
@@ -87,6 +91,82 @@ def make_performance_figure(
     # Title: default to empty (user requested no visible title)
     if title is None:
         title = ""
+
+    # Add Monte Carlo percentile bands first (so they appear behind strategy line)
+    if monte_carlo_result is not None and monte_carlo_result.get("percentiles"):
+        percentiles = monte_carlo_result["percentiles"]
+        
+        # Get p10 and p90 for the band
+        if "p10" in percentiles and "p90" in percentiles:
+            p10 = _reexpress_series(percentiles["p10"], y_as)
+            p90 = _reexpress_series(percentiles["p90"], y_as)
+            
+            # Add lower bound (invisible)
+            fig.add_trace(
+                go.Scatter(
+                    x=p10.index,
+                    y=p10.values,
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+            # Add upper bound with fill
+            fig.add_trace(
+                go.Scatter(
+                    x=p90.index,
+                    y=p90.values,
+                    mode="lines",
+                    fill="tonexty",
+                    fillcolor="rgba(128, 128, 128, 0.25)",
+                    line=dict(width=0),
+                    name="MC Random P10–P90",
+                    hoverinfo="skip",
+                )
+            )
+        
+        # Add p25-p75 band (darker)
+        if "p25" in percentiles and "p75" in percentiles:
+            p25 = _reexpress_series(percentiles["p25"], y_as)
+            p75 = _reexpress_series(percentiles["p75"], y_as)
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=p25.index,
+                    y=p25.values,
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=p75.index,
+                    y=p75.values,
+                    mode="lines",
+                    fill="tonexty",
+                    fillcolor="rgba(128, 128, 128, 0.35)",
+                    line=dict(width=0),
+                    name="MC Random P25–P75",
+                    hoverinfo="skip",
+                )
+            )
+        
+        # Add median line
+        if "p50" in percentiles:
+            p50 = _reexpress_series(percentiles["p50"], y_as)
+            fig.add_trace(
+                go.Scatter(
+                    x=p50.index,
+                    y=p50.values,
+                    mode="lines",
+                    name="MC Random Median",
+                    line=dict(width=1.5, dash="dash", color="rgba(150, 150, 150, 0.8)"),
+                    hovertemplate="MC Median<br>%{x|%Y-%m-%d}<br>%{y:.2f}<extra></extra>",
+                )
+            )
 
     if _is_ensemble_df(df):
         mean = _reexpress_series(df["Ensemble Mean"], y_as)
@@ -138,7 +218,8 @@ def make_performance_figure(
                 x=s.index,
                 y=s.values,
                 mode="lines",
-                name=key,
+                name="Your Strategy",
+                line=dict(width=2.5, color="#00cc96"),
                 hovertemplate="%{x|%Y-%m-%d}<br>%{y:.2f}<extra></extra>",
             )
         )
@@ -321,4 +402,101 @@ def make_holdings_heatmap_figure(
     fig.update_yaxes(title_text=f"Selection order by: {ordering_label}", row=1, col=1)
     fig.update_xaxes(title_text="Avg Return (%)", row=1, col=2)
 
+    return fig
+
+
+def make_monte_carlo_histogram(
+    mc_result: Dict,
+    *,
+    strategy_return: Optional[float] = None,
+    title: Optional[str] = None,
+    template: str = "plotly_dark",
+) -> "object":
+    """Create a histogram of Monte Carlo final returns.
+    
+    Parameters
+    ----------
+    mc_result : dict
+        Result from run_monte_carlo_null_distribution containing 'final_returns_pct'.
+    strategy_return : float, optional
+        Your strategy's final return (%) to show as a vertical line.
+    title : str, optional
+        Plot title.
+    template : str
+        Plotly template.
+    
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    go, _ = _import_plotly()
+    if go is None:
+        raise ImportError("Plotly is not available")
+    
+    final_returns = mc_result.get("final_returns_pct", [])
+    if not final_returns:
+        raise ValueError("No final returns data in mc_result")
+    
+    import numpy as np
+    
+    fig = go.Figure()
+    
+    # Histogram of random strategy returns
+    fig.add_trace(
+        go.Histogram(
+            x=final_returns,
+            nbinsx=30,
+            name="Random Selection Returns",
+            marker_color="rgba(100, 100, 100, 0.7)",
+            hovertemplate="Return: %{x:.1f}%<br>Count: %{y}<extra></extra>",
+        )
+    )
+    
+    # Add vertical line for strategy return
+    if strategy_return is not None:
+        # Calculate percentile
+        pct_rank = (np.array(final_returns) < strategy_return).mean() * 100
+        
+        # Determine color based on performance
+        if pct_rank >= 75:
+            color = "#00cc96"  # Green
+        elif pct_rank >= 50:
+            color = "#ffa500"  # Orange
+        else:
+            color = "#ef553b"  # Red
+        
+        fig.add_vline(
+            x=strategy_return,
+            line_width=3,
+            line_dash="solid",
+            line_color=color,
+            annotation_text=f"Your Strategy: {strategy_return:.1f}% (P{pct_rank:.0f})",
+            annotation_position="top",
+            annotation_font_color=color,
+        )
+    
+    # Add mean line
+    mean_return = np.mean(final_returns)
+    fig.add_vline(
+        x=mean_return,
+        line_width=2,
+        line_dash="dash",
+        line_color="rgba(255, 255, 255, 0.5)",
+        annotation_text=f"MC Mean: {mean_return:.1f}%",
+        annotation_position="bottom",
+        annotation_font_color="rgba(255, 255, 255, 0.7)",
+    )
+    
+    if title is None:
+        title = ""
+    
+    fig.update_layout(
+        template=template,
+        title=title,
+        xaxis_title="Total Return (%)",
+        yaxis_title="Frequency",
+        showlegend=False,
+        margin=dict(l=40, r=20, t=40, b=40),
+    )
+    
     return fig
